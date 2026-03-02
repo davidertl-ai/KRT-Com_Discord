@@ -43,15 +43,6 @@ TRAEFIK_VERSION="3.3.3"
 TRAEFIK_SERVICE_FILE="/etc/systemd/system/traefik.service"
 
 # --------------------------------------------------
-# Helper: Port check
-# --------------------------------------------------
-port_in_use() {
-  local host="$1"
-  local port="$2"
-  ss -lnt "( sport = :$port )" 2>/dev/null | awk 'NR>1{print $4}' | grep -q "${host}:${port}" 2>/dev/null
-}
-
-# --------------------------------------------------
 # Helper: Safe overwrite (backup if exists + differs)
 # --------------------------------------------------
 write_file_backup() {
@@ -272,6 +263,12 @@ if [ "$CREATE_ENV" = "y" ]; then
   [ -n "$EXISTING_CLIENT_SECRET" ] && PROMPT_CS="$PROMPT_CS [****${EXISTING_CLIENT_SECRET: -4}]"
   read -r -p "$(echo -e "${CYAN}${PROMPT_CS}:${NC} ")" INPUT_CLIENT_SECRET
   DISCORD_CLIENT_SECRET="${INPUT_CLIENT_SECRET:-$EXISTING_CLIENT_SECRET}"
+
+  # Domain (needed for default Redirect URI)
+  PROMPT_DOMAIN_EARLY="Domain (z.B. das-krt.com)"
+  [ -n "$EXISTING_DOMAIN" ] && PROMPT_DOMAIN_EARLY="$PROMPT_DOMAIN_EARLY [$EXISTING_DOMAIN]"
+  read -r -p "$(echo -e "${CYAN}${PROMPT_DOMAIN_EARLY}:${NC} ")" INPUT_DOMAIN_EARLY
+  DOMAIN="${INPUT_DOMAIN_EARLY:-$EXISTING_DOMAIN}"
 
   # Discord Redirect URI
   DEFAULT_REDIRECT="https://${DOMAIN:-localhost}/auth/callback"
@@ -729,8 +726,7 @@ function migrateUserIdHashing(db) {
   const txStore = createTxStore(db);
   const usersStore = createUsersStore(db);
 
-  const tokenSecret = process.env.TOKEN_SECRET || '';
-  if (!tokenSecret) console.warn('[WARN] TOKEN_SECRET not set - token-based auth will be disabled');
+  const tokenSecret = mustEnv('TOKEN_SECRET');
 
   // Discord OAuth2 config
   const discordClientId = process.env.DISCORD_CLIENT_ID || '';
@@ -1170,7 +1166,8 @@ const { verifyToken, hashUserId } = require('./crypto');
  */
 function createVoiceRelay({ db, usersStore, allowedGuildIds = [], tokenSecret = '', dsgvo = null }) {
   // Session management
-  const sessions = new Map();       // sessionToken -> { discordUserId, guildId, displayName, ws, frequencies: Set, lastSeen }
+  const sessions = new Map();
+  const cleaningUp = new Set();  // Guard against double-cleanup race       // sessionToken -> { discordUserId, guildId, displayName, ws, frequencies: Set, lastSeen }
 
   // Frequency subscriptions: freqId -> Set<sessionToken>
   const freqSubscribers = new Map();
@@ -1502,8 +1499,10 @@ function createVoiceRelay({ db, usersStore, allowedGuildIds = [], tokenSecret = 
   }
 
   function cleanupSession(token) {
+    if (cleaningUp.has(token)) return; // Guard: already being cleaned up
     const session = sessions.get(token);
     if (!session) return;
+    cleaningUp.add(token);
 
     // Remove from all frequency subscriptions and notify remaining subscribers
     for (const freqId of session.frequencies) {
@@ -1538,6 +1537,7 @@ function createVoiceRelay({ db, usersStore, allowedGuildIds = [], tokenSecret = 
     db.prepare('DELETE FROM voice_sessions WHERE session_token = ?').run(hashedToken);
 
     sessions.delete(token);
+    cleaningUp.delete(token);
     console.log('[voice] Session cleaned up:', session.discordUserId);
   }
 
@@ -2238,7 +2238,7 @@ function createWsHub({ stateStore, tokenSecret }) {
       const { verifyToken } = require('./crypto');
       const payload = verifyToken(token, tokenSecret);
       if (!payload) { ws.close(4001, 'Invalid token'); return; }
-      ws.userId = payload.discordUserId;
+      ws.userId = payload.uid;
     } catch (e) {
       ws.close(4001, 'Auth failed');
       return;
@@ -2600,24 +2600,17 @@ function createHttpServer({ db, mapping, stateStore, txStore, usersStore, dsgvo,
   let onTxEventFn = null;
   let _bot = bot;
 
-  // In-memory pending OAuth states: state -> { token, displayName, timestamp } or null (pending)
+  // In-memory pending OAuth states: state -> { token, displayName, timestamp, error } or { pending: true, timestamp }
   const pendingOAuth = new Map();
   // Cleanup old pending states every 5 minutes
   setInterval(() => {
     const now = Date.now();
     for (const [state, val] of pendingOAuth) {
-      if (!val && (pendingOAuthTimestamps.get(state) || 0) < now - 5 * 60 * 1000) {
+      if (val && (val.timestamp || 0) < now - 5 * 60 * 1000) {
         pendingOAuth.delete(state);
-        pendingOAuthTimestamps.delete(state);
-      }
-      if (val && val.timestamp < now - 5 * 60 * 1000) {
-        pendingOAuth.delete(state);
-        pendingOAuthTimestamps.delete(state);
       }
     }
   }, 5 * 60 * 1000);
-  // Track timestamps for pending states
-  const pendingOAuthTimestamps = new Map();
 
   app.get('/health', (req, res) => res.json({ ok: true }));
 
@@ -2660,6 +2653,60 @@ function createHttpServer({ db, mapping, stateStore, txStore, usersStore, dsgvo,
     const debugActive = dsgvo ? dsgvo.getStatus().debugMode : false;
     if (!debugActive) {
       return res.status(410).json({ ok: false, error: 'direct_login_disabled', message: 'Direct login is disabled. Use Discord OAuth2 to log in. Enable debug mode via service.sh to re-enable.' });
+    }
+    const { discordUserId, guildId } = req.body || {};
+    if (!discordUserId || !guildId) {
+      return res.status(400).json({ ok: false, error: 'missing discordUserId or guildId' });
+    }
+    // Hash the raw Discord ID | raw IDs are never stored
+    const hashedId = hashUserId(discordUserId);
+
+    // Check if banned
+    if (dsgvo && typeof dsgvo.isBanned === 'function' && dsgvo.isBanned(hashedId)) {
+      return res.status(403).json({ ok: false, error: 'access denied' });
+    }
+
+    // Look up user in local cache
+    let user = usersStore ? usersStore.get(hashedId, String(guildId)) : null;
+    if (!user) {
+      // Fallback: live Discord API lookup if not in cache
+      if (_bot && typeof _bot.fetchGuildMember === 'function') {
+        const fetched = await _bot.fetchGuildMember(String(discordUserId), String(guildId));
+        if (fetched) {
+          user = { display_name: fetched.displayName };
+        }
+      }
+
+      if (!user) {
+        return res.status(404).json({ ok: false, error: 'user not found in guild' });
+      }
+    }
+
+    // Check policy acceptance
+    const policyAccepted = dsgvo
+      ? dsgvo.hasPolicyAcceptance(hashedId, policyVersion || '1.0')
+      : true;
+
+    if (!tokenSecret) {
+      return res.status(500).json({ ok: false, error: 'server token secret not configured' });
+    }
+
+    // Issue signed token (uid is the hashed ID)
+    const payload = {
+      uid: hashedId,
+      gid: String(guildId),
+      name: user.display_name || hashedId.substring(0, 12) + '...',
+      iat: Date.now(),
+      exp: Date.now() + 24 * 60 * 60 * 1000,
+    };
+    const authToken = signToken(payload, tokenSecret);
+
+    // Store token in DB (hashed user ID) | remove old tokens first
+    db.prepare('DELETE FROM auth_tokens WHERE discord_user_id = ?').run(hashedId);
+    db.prepare('INSERT INTO auth_tokens (discord_user_id, token, created_at_ms) VALUES (?,?,?)').run(hashedId, authToken, Date.now());
+
+    res.json({ ok: true, token: authToken, displayName: user.display_name, policyAccepted });
+  });
     }
     // Hash the raw Discord ID | raw IDs are never stored
     const hashedId = hashUserId(discordUserId);
@@ -2764,8 +2811,7 @@ function createHttpServer({ db, mapping, stateStore, txStore, usersStore, dsgvo,
       return res.status(500).send('Discord OAuth2 not configured on this server');
     }
     // Register state so the callback can find it later
-    pendingOAuth.set(state, null);
-    pendingOAuthTimestamps.set(state, Date.now());
+    pendingOAuth.set(state, { pending: true, timestamp: Date.now() });
     const scope = 'identify guilds';
     let url = 'https://discord.com/oauth2/authorize?response_type=code';
     url += '&client_id=' + encodeURIComponent(discordClientId);
@@ -2901,7 +2947,6 @@ function createHttpServer({ db, mapping, stateStore, txStore, usersStore, dsgvo,
     }
     if (result.error) {
       pendingOAuth.delete(state);
-      pendingOAuthTimestamps.delete(state);
       return res.json({ ok: true, data: { status: 'error', error: result.error } });
     }
 
@@ -2918,6 +2963,14 @@ function createHttpServer({ db, mapping, stateStore, txStore, usersStore, dsgvo,
   });
 
   app.get('/state', (req, res) => {
+    // Require bearer token authentication
+    const authHeader = req.headers['authorization'] || '';
+    if (authHeader.startsWith('Bearer ')) {
+      const tokenPayload = verifyToken(authHeader.slice(7), tokenSecret);
+      if (!tokenPayload) return res.status(401).json({ ok: false, error: 'invalid or expired token' });
+    } else {
+      return res.status(401).json({ ok: false, error: 'missing bearer token' });
+    }
     const raw = parseInt(req.query.limit, 10);
     const limit = Math.min(Number.isFinite(raw) ? raw : 200, 1000);
     const rows = stateStore.listRecent(limit);
@@ -2979,6 +3032,14 @@ function createHttpServer({ db, mapping, stateStore, txStore, usersStore, dsgvo,
   });
   // TX: read
   app.get('/tx/recent', (req, res) => {
+    // Require bearer token authentication
+    const authHeader = req.headers['authorization'] || '';
+    if (authHeader.startsWith('Bearer ')) {
+      const tokenPayload = verifyToken(authHeader.slice(7), tokenSecret);
+      if (!tokenPayload) return res.status(401).json({ ok: false, error: 'invalid or expired token' });
+    } else {
+      return res.status(401).json({ ok: false, error: 'missing bearer token' });
+    }
     const raw = parseInt(req.query.limit, 10);
     const limit = Math.min(Number.isFinite(raw) ? raw : 200, 1000);
     const freq = req.query.freqId ? Number(req.query.freqId) : null;
@@ -2989,6 +3050,14 @@ function createHttpServer({ db, mapping, stateStore, txStore, usersStore, dsgvo,
 
   // Frequency listener registration
   app.post('/freq/join', (req, res) => {
+    // Require bearer token authentication
+    const authHeader = req.headers['authorization'] || '';
+    if (authHeader.startsWith('Bearer ')) {
+      const tokenPayload = verifyToken(authHeader.slice(7), tokenSecret);
+      if (!tokenPayload) return res.status(401).json({ ok: false, error: 'invalid or expired token' });
+    } else {
+      return res.status(401).json({ ok: false, error: 'missing bearer token' });
+    }
     const { discordUserId, freqId, radioSlot } = req.body || {};
     if (!discordUserId || !freqId) {
       return res.status(400).json({ ok: false, error: 'missing discordUserId or freqId' });
@@ -3005,6 +3074,14 @@ function createHttpServer({ db, mapping, stateStore, txStore, usersStore, dsgvo,
     res.json({ ok: true, listener_count: row ? row.cnt : 0 });
   });
   app.post('/freq/leave', (req, res) => {
+    // Require bearer token authentication
+    const authHeader = req.headers['authorization'] || '';
+    if (authHeader.startsWith('Bearer ')) {
+      const tokenPayload = verifyToken(authHeader.slice(7), tokenSecret);
+      if (!tokenPayload) return res.status(401).json({ ok: false, error: 'invalid or expired token' });
+    } else {
+      return res.status(401).json({ ok: false, error: 'missing bearer token' });
+    }
     const { discordUserId, freqId } = req.body || {};
     if (!discordUserId || !freqId) {
       return res.status(400).json({ ok: false, error: 'missing discordUserId or freqId' });
@@ -3092,7 +3169,10 @@ function createHttpServer({ db, mapping, stateStore, txStore, usersStore, dsgvo,
     }
     const hashedId = hashUserId(String(discordUserId));
     const result = dsgvo.deleteUser(hashedId);
-    res.json({ ok: true, data: result });
+    // Kick active voice sessions for this user
+    const kicked = _voiceRelay ? _voiceRelay.kickUser(hashedId) : 0;
+    console.log(`[admin] Deleted user data ${hashedId.substring(0, 12)}... → ${kicked} session(s) kicked`);
+    res.json({ ok: true, data: { ...result, kicked } });
   });
 
   // Delete all data for a specific guild
@@ -3175,7 +3255,7 @@ function createHttpServer({ db, mapping, stateStore, txStore, usersStore, dsgvo,
     if (dsgvo && typeof dsgvo.unbanUser === 'function') {
       const hashedId = hashUserId(String(discordUserId));
       const removed = dsgvo.unbanUser(hashedId);
-      console.log(`[admin] Banned user ${hashedId.substring(0, 12)}... → ${kicked} session(s) kicked`);
+      console.log(`[admin] Unbanned user ${hashedId.substring(0, 12)}... (removed: ${removed})`);
       res.json({ ok: true, data: { removed } });
     } else {
       res.status(500).json({ ok: false, error: 'dsgvo module not available' });
