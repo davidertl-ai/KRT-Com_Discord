@@ -1,0 +1,73 @@
+name: CI - Syntax Check
+
+on:
+  push:
+    branches: [ main, 'fix/**', 'feature/**' ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  syntax-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Check JavaScript syntax (embedded sources)
+        run: |
+          echo "=== Extracting embedded JS from install.sh ==="
+          # Extract all JS heredoc blocks and syntax-check them
+          BACKEND_DIR=$(mktemp -d)
+          SRC_DIR="$BACKEND_DIR/src"
+          mkdir -p "$SRC_DIR"
+
+          # Use awk to extract heredocs between write_file_backup and EOF
+          awk '
+            /write_file_backup.*\$SRC_DIR.*cat <<.EOF/ {
+              match($0, /write_file_backup "[^"]*\/([^"]+)"/, arr)
+              fname = arr[1]
+              if (fname == "") { match($0, /\/([a-z]+\.js)"/, arr2); fname = arr2[1] }
+              getline
+              outfile = "'"$SRC_DIR"'/" fname
+              while ((getline line) > 0 && line !~ /^EOF/) {
+                print line > outfile
+              }
+              close(outfile)
+            }
+            /write_file_backup "\$BACKEND_DIR\/index.js".*cat <<.EOF/ {
+              getline
+              outfile = "'"$BACKEND_DIR"'/index.js"
+              while ((getline line) > 0 && line !~ /^EOF/) {
+                print line > outfile
+              }
+              close(outfile)
+            }
+          ' server/install.sh
+
+          echo "=== Syntax checking extracted files ==="
+          EXIT_CODE=0
+          for f in "$BACKEND_DIR"/index.js "$SRC_DIR"/*.js; do
+            if [ -f "$f" ]; then
+              if node --check "$f" 2>&1; then
+                echo "[OK] $(basename $f)"
+              else
+                echo "[FAIL] $(basename $f)"
+                EXIT_CODE=1
+              fi
+            fi
+          done
+          exit $EXIT_CODE
+
+      - name: ShellCheck install.sh
+        run: |
+          # Install shellcheck if not present
+          if ! command -v shellcheck &> /dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          fi
+          # Run shellcheck with relaxed severity (info-level disabled)
+          shellcheck --severity=warning server/install.sh server/service.sh || true
